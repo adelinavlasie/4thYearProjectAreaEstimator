@@ -1,0 +1,529 @@
+"""Final script for training the leaf area regression model.
+
+This script defines and trains a CNN model to estimate the area of leaf
+fragments carried by ants from digital images.
+
+The model architecture is inspired by the WOLO network described in the
+following paper:
+
+Citation:
+    Plum, F., Plum, L., Bischoff, C., & Labonte, D. (2024).
+    Wolo: Wilson Only Looks Once – Estimating Ant Body Mass from
+    Reference-Free Images Using Deep Convolutional Neural Networks.
+    Available at SSRN: https://doi.org/10.2139/ssrn.4833157
+
+__author__ = "Adelina Vlasie"
+
+__date__ = "2025-06-09"
+"""
+import sys
+import os
+import shutil
+import pickle
+import random
+import argparse
+from os.path import join, isdir
+from sklearn.utils import shuffle
+from sklearn.model_selection import train_test_split 
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.python.client import device_lib
+
+
+# Define script parameters and sys.argv simulation 
+output_dir_name_on_drive = "area_model_run_real_plus_synthetic50" 
+colab_outputs_base_dir = '/content/drive/MyDrive/ColabModelOutputs'
+output_dir_path = os.path.join(colab_outputs_base_dir, output_dir_name_on_drive)
+os.makedirs(output_dir_path, exist_ok=True)
+
+sys.argv = [
+    'your_script_name.py',
+    '-d', '/content/drive/MyDrive/real_patches/side/carrying_side',# Real carrying
+    '-dnc','/content/drive/MyDrive/real_patches/side/random_side',    # Real non-carrying
+
+    '-dsc', '/content/drive/My Drive/SyntheticData/noncarryingFabi', # Path to synthetic carrying
+    '-dsnc', '/content/drive/MyDrive/SyntheticData/carryingArea1.5ExpandBox', # Path to synthetic non-carrying
+    '-o', output_dir_path,
+    '-b', 'simple',
+    '-e', '50',
+    '-bs', '32',
+    '--no_augmentation', 
+    '-lr', '0.0001',
+    '--log_transform',
+    '-t', '/content/drive/MyDrive/real_patches/side/carrying_side/test',
+    '--loss_func', 'MSE_keras',
+    '--img_size', '128',
+    '--rand_seed', '42',
+]
+# --- End of sys.argv setup ---
+
+print(f"TensorFlow Version: {tf.__version__}")
+
+LOG_Y_MIN_CALCULATED = None
+LOG_Y_MAX_CALCULATED = None
+DEFAULT_Y_MIN_LOG = 0.0001
+DEFAULT_Y_MAX_LOG = 0.05
+VERY_SMALL_POSITIVE_FLOAT = tf.constant(1e-9, dtype=tf.float32)
+LOG = False 
+
+#  Data Loading and Label Extraction 
+def importLabeledImages(target_directory):
+    X = []
+    y_labels = []
+    print(f"INFO: Reading images from: {target_directory}")
+    if not isdir(target_directory):
+        print(f"WARNING: Directory {target_directory} not found. Returning empty lists.")
+        return X, y_labels
+
+    for root, dirs, files in os.walk(target_directory): # Changed to os.walk to include subfolders if any
+        for filename in files:
+            if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')) or filename.startswith("._"):
+                continue
+
+            file_path = join(root, filename)
+            area_value = 0.0
+
+            if "_a" in filename:
+                try:
+                    area_segment = filename.split("_a")[-1]
+                    part_before_first_underscore = area_segment.split("_")[0]
+
+                    if '.' in part_before_first_underscore:
+                        area_parts = part_before_first_underscore.split(".")
+                        if len(area_parts) > 1 :
+                            area_value_str = area_parts[0] + "." + area_parts[1]
+                        else:
+                            area_value_str = area_parts[0]
+                    else:
+                        area_value_str = part_before_first_underscore
+                    parsed_area = float(area_value_str)
+                    area_value = parsed_area
+                except (ValueError, IndexError) as e:
+                    print(f"WARNING: Could not extract area from filename: {filename} (in {root}) despite '_a'. Error: {e}. Defaulting to area=0.0 for this file.")
+                    pass
+
+            X.append(file_path)
+            y_labels.append(area_value)
+
+    if not X:
+        print(f"WARNING: No valid image files were found in {target_directory} and its subfolders.")
+    else:
+        num_zero_labels = sum(1 for y_val in y_labels if y_val == 0.0)
+        print(f"Loaded {len(X)} images and {len(y_labels)} labels from {target_directory}.")
+        print(f"INFO: From this path, {num_zero_labels} images were assigned an area of 0.0.")
+    return X, y_labels
+
+# Dynamic Min/Max Calculation for Log Transform 
+def calculate_and_set_y_min_max(y_values, padding_factor=0.05, min_floor_val=1e-7):
+    global LOG_Y_MIN_CALCULATED, LOG_Y_MAX_CALCULATED
+
+    if not y_values:
+        print("WARNING: y_values list is empty for min/max calculation. Using defaults.")
+        LOG_Y_MIN_CALCULATED = DEFAULT_Y_MIN_LOG; LOG_Y_MAX_CALCULATED = DEFAULT_Y_MAX_LOG; return
+    y_values_np = np.array([val for val in y_values if val is not None], dtype=float)
+    if y_values_np.size == 0:
+        print("WARNING: y_values list contains no valid numbers for min/max calculation. Using defaults.")
+        LOG_Y_MIN_CALCULATED = DEFAULT_Y_MIN_LOG; LOG_Y_MAX_CALCULATED = DEFAULT_Y_MAX_LOG; return
+    positive_y_values = y_values_np[y_values_np > 0]
+    if positive_y_values.size == 0:
+        print("INFO: No positive y_values found for log-scaling. Using default log transform range.")
+        LOG_Y_MIN_CALCULATED = DEFAULT_Y_MIN_LOG; LOG_Y_MAX_CALCULATED = DEFAULT_Y_MAX_LOG;
+        print(f"INFO: Using default log transform range: LOG_Y_MIN={LOG_Y_MIN_CALCULATED}, LOG_Y_MAX={LOG_Y_MAX_CALCULATED}"); return
+    actual_min = np.min(positive_y_values); actual_max = np.max(positive_y_values)
+    print(f"INFO: Original positive y_values for log-scaling (informational): Min={actual_min}, Max={actual_max}")
+    data_range = actual_max - actual_min
+    if data_range < min_floor_val:
+        safe_actual_min = max(actual_min, min_floor_val); padded_min = safe_actual_min * (1 - padding_factor)
+        padded_max = safe_actual_min * (1 + padding_factor); padded_min = max(padded_min, min_floor_val)
+        if padded_max <= padded_min : padded_max = padded_min + min_floor_val*10
+    else:
+        padded_min = actual_min - data_range * padding_factor; padded_max = actual_max + data_range * padding_factor
+    LOG_Y_MIN_CALCULATED = max(padded_min, min_floor_val)
+    LOG_Y_MAX_CALCULATED = max(padded_max, LOG_Y_MIN_CALCULATED + min_floor_val)
+    print(f"INFO: Informational LOG_Y_MIN={LOG_Y_MIN_CALCULATED}, LOG_Y_MAX={LOG_Y_MAX_CALCULATED}")
+
+# Log Transformation and De-transformation 
+def log_transform_only(y):
+    y_tf = tf.cast(y, tf.float32)
+    y_safe = tf.maximum(y_tf, VERY_SMALL_POSITIVE_FLOAT)
+    y_log = tf.math.log(y_safe)
+    return y_log
+
+def delog_predictions(y_log_pred):
+    y_log_pred_tf = tf.cast(y_log_pred, tf.float32)
+    y_original_scale = tf.math.exp(y_log_pred_tf)
+    return y_original_scale
+
+#  Custom Metric 
+def MAPE(y_true_log_input, y_pred_log_input, scaling_factor=1.0, min_val_offset=0.0):
+    global LOG
+    if LOG:
+        y_true_rescaled = tf.math.exp(tf.cast(y_true_log_input, tf.float32))
+        y_pred_rescaled = tf.math.exp(tf.cast(y_pred_log_input, tf.float32))
+    else:
+        y_true_rescaled = y_true_log_input; y_pred_rescaled = y_pred_log_input
+    y_true_final = (y_true_rescaled + min_val_offset) * scaling_factor
+    y_pred_final = (y_pred_rescaled + min_val_offset) * scaling_factor
+    floor = tf.maximum(tf.abs(y_true_final), 1e-5)
+    ape = tf.math.abs(tf.math.divide(y_true_final - y_pred_final, floor))
+    mape_val = tf.math.multiply(tf.constant(100.0, tf.float32), tf.math.reduce_mean(ape, axis=-1))
+    return mape_val
+
+#  Image Parsing Function 
+def parse_function(filename, label):
+    image_string = tf.io.read_file(filename)
+    image = tf.image.decode_jpeg(image_string, channels=3)
+    image = tf.image.convert_image_dtype(image, tf.float32)
+    return image, label
+
+#  Model Architectures (Linear Output) 
+
+def build_with_Xception(input_shape, output_nodes=1, refine_backbone=False):
+    base_model = keras.applications.Xception(weights="imagenet", input_shape=input_shape, include_top=False)
+    base_model.trainable = refine_backbone
+    inputs = keras.Input(shape=input_shape)
+    scale_layer = keras.layers.Rescaling(scale=1.0/127.5, offset=-1.0)(inputs)
+    x = base_model(scale_layer, training=refine_backbone)
+    x = keras.layers.GlobalAveragePooling2D()(x)
+    x = keras.layers.Dropout(0.2)(x)
+    x = keras.layers.Dense(1024, activation="relu")(x)
+    x = keras.layers.Dropout(0.2)(x)
+    outputs = keras.layers.Dense(output_nodes, activation='linear', name='output')(x)
+    model = keras.Model(inputs=inputs, outputs=outputs)
+    return model
+
+
+
+def build_simple_cnn(input_shape, output_nodes=1):
+    inputs = keras.Input(shape=input_shape, name='input_layer')
+    x = keras.layers.Conv2D(32, (3,3), padding='same', activation='relu')(inputs)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.MaxPooling2D((2,2))(x)
+    x = keras.layers.Conv2D(64, (3,3), padding='same', activation='relu')(x)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.MaxPooling2D((2,2))(x)
+    x = keras.layers.Conv2D(128, (3,3), padding='same', activation='relu')(x)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.MaxPooling2D((2,2))(x)
+    x = keras.layers.Flatten()(x)
+    x = keras.layers.Dense(512, activation='relu')(x)
+    x = keras.layers.Dropout(0.5)(x)
+    outputs = keras.layers.Dense(output_nodes, activation='linear', name='output')(x)
+    model = keras.Model(inputs=inputs, outputs=outputs, name='simple_cnn')
+    return model
+
+def custom_regression_loss(alpha=0.7, beta=0.3, epsilon=1e-5): 
+    def loss(y_true_log, y_pred_log):
+        y_true_original = tf.math.exp(y_true_log)
+        y_pred_original = tf.math.exp(y_pred_log)
+        floor = tf.maximum(tf.abs(y_true_original), epsilon)
+        mape_component = tf.reduce_mean(tf.abs((y_true_original - y_pred_original) / floor)) 
+        mse_component_log_scale = tf.reduce_mean(tf.square(y_true_log - y_pred_log))
+        total_loss = alpha * mape_component + beta * mse_component_log_scale
+        return total_loss
+    return loss
+
+# Main Execution Block 
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Train an image regression model for area prediction.")
+    ap.add_argument("-d", "--dataset", required=True, type=str)
+    ap.add_argument("-dnc", "--dataset_non_carrying", default=None, type=str)
+    # arguments for synthetic data
+    ap.add_argument("-dsc", "--dataset_synth_carrying", default=None, type=str, help="Path to synthetic carrying ants dataset.")
+    ap.add_argument("-dsnc", "--dataset_synth_non_carrying", default=None, type=str, help="Path to synthetic non-carrying ants dataset.")
+
+    ap.add_argument("-o", "--output_dir", required=True, type=str)
+    ap.add_argument("-b", "--backbone", default="simple", choices=['simple', 'Xception', 'EfficientNetB0', 'EfficientNetB7', 'None'], type=str)
+    ap.add_argument("-l", "--loss_func", default="MSE_keras", type=str)
+    ap.add_argument("-e", "--epochs", default=50, type=int)
+    ap.add_argument("-bs", "--batch_size", default=32, type=int)
+    ap.add_argument("-sw", "--save_weights_every", default=1, type=int)
+    ap.add_argument("-aug", "--augmentation", action='store_true')
+    ap.add_argument("-no_aug", "--no_augmentation", action='store_false', dest='augmentation')
+    ap.set_defaults(augmentation=False)
+    ap.add_argument("-log", "--log_transform", action='store_true')
+    ap.add_argument("-no_log", "--no_log_transform", action='store_false', dest='log_transform')
+    ap.set_defaults(log_transform=True)
+    ap.add_argument("-t", "--test_dataset", default=None, type=str)
+    ap.add_argument("-lr", "--learning_rate", default=0.0001, type=float)
+    ap.add_argument("-rB", "--refine_backbone", action='store_true')
+    ap.add_argument("-cp", "--checkpoint", default=None, type=str)
+    ap.add_argument("--rand_seed", default=42, type=int)
+    ap.add_argument("--img_size", default=128, type=int)
+    args = ap.parse_args()
+
+    LOG = args.log_transform
+    EPOCHS = args.epochs
+    BATCH_SIZE = args.batch_size
+    VERBOSE = 1
+    IMG_ROWS, IMG_COLS = args.img_size, args.img_size
+    INPUT_SHAPE_RGB = (IMG_ROWS, IMG_COLS, 3)
+    NUM_PARALLEL_CALLS = tf.data.AUTOTUNE
+    DATA_PATH = args.dataset
+    TEST_DATA_PATH = args.test_dataset
+    SEED = args.rand_seed
+    AUGMENTATION_ENABLED = args.augmentation
+    LEARNING_RATE = args.learning_rate
+    REFINE_BACKBONE_ENABLED = args.refine_backbone
+
+    print("\n--- Training Settings ---")
+    for k, v in vars(args).items(): print(f"{k.upper()}: {v}")
+    print(f"INPUT_SHAPE: {INPUT_SHAPE_RGB}")
+    print("-------------------------\n")
+
+    np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
+
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+        print(f"INFO: Created output directory: {args.output_dir}")
+
+    print("INFO: Setting up data pipelines...")
+    with tf.device('/cpu:0'):
+        X_all_paths = []
+        y_all_labels = []
+
+        # Load REAL carrying data
+        if DATA_PATH: # Check if primary dataset path is provided
+            print(f"INFO: Loading REAL carrying dataset from: {DATA_PATH}")
+            X_real_carrying_paths, y_real_carrying_labels = importLabeledImages(DATA_PATH)
+            if X_real_carrying_paths:
+                X_all_paths.extend(X_real_carrying_paths)
+                y_all_labels.extend(y_real_carrying_labels)
+
+        # Load REAL non-carrying data
+        if args.dataset_non_carrying:
+            print(f"INFO: Attempting to load REAL non-carrying dataset from: {args.dataset_non_carrying}")
+            X_real_non_carrying_paths, y_real_non_carrying_labels = importLabeledImages(args.dataset_non_carrying)
+            if X_real_non_carrying_paths:
+                X_all_paths.extend(X_real_non_carrying_paths)
+                y_all_labels.extend(y_real_non_carrying_labels)
+                print(f"INFO: Successfully added {len(X_real_non_carrying_paths)} images from REAL non-carrying dataset.")
+
+        #  Load SYNTHETIC carrying data 
+        if args.dataset_synth_carrying:
+            print(f"INFO: Attempting to load SYNTHETIC carrying dataset from: {args.dataset_synth_carrying}")
+            X_synth_carrying_paths, y_synth_carrying_labels = importLabeledImages(args.dataset_synth_carrying)
+            if X_synth_carrying_paths:
+                X_all_paths.extend(X_synth_carrying_paths)
+                y_all_labels.extend(y_synth_carrying_labels)
+                print(f"INFO: Successfully added {len(X_synth_carrying_paths)} images from SYNTHETIC carrying dataset.")
+
+        #   Load SYNTHETIC non-carrying data 
+        if args.dataset_synth_non_carrying:
+            print(f"INFO: Attempting to load SYNTHETIC non-carrying dataset from: {args.dataset_synth_non_carrying}")
+            X_synth_non_carrying_paths, y_synth_non_carrying_labels = importLabeledImages(args.dataset_synth_non_carrying)
+            if X_synth_non_carrying_paths:
+                X_all_paths.extend(X_synth_non_carrying_paths)
+                y_all_labels.extend(y_synth_non_carrying_labels)
+                print(f"INFO: Successfully added {len(X_synth_non_carrying_paths)} images from SYNTHETIC non-carrying dataset.")
+
+        if not X_all_paths:
+             print("ERROR: No training data loaded from any specified path. Exiting."); sys.exit(1)
+
+        print(f"INFO: Total images (real + synthetic) loaded for train/validation split: {len(X_all_paths)}")
+
+        NUM_CLASSES = 1
+        if LOG:
+            print("INFO: Log transformation enabled. Targets will be raw log-scaled values.")
+            calculate_and_set_y_min_max(y_all_labels)
+        else:
+            print("INFO: Log transformation disabled. Model will predict original scale areas.")
+
+        X_all_paths, y_all_labels = shuffle(X_all_paths, y_all_labels, random_state=SEED)
+
+        # Split data into training and validation sets ( 80% train, 20% validation)
+        # This split is done after all data (real and synthetic) is combined and shuffled.
+       
+        X_train_paths, X_temp_paths, y_train_labels, y_temp_labels = train_test_split(
+             X_all_paths, y_all_labels, test_size=0.2, random_state=SEED # Using 20% for temp 
+        )
+        
+    
+        train_ds = tf.data.Dataset.from_tensor_slices((X_all_paths, y_all_labels)) # Using all data for training
+
+        def process_path(filename, label): 
+            image_string = tf.io.read_file(filename)
+            image = tf.image.decode_jpeg(image_string, channels=3)
+            image = tf.image.convert_image_dtype(image, tf.float32)
+            image_resized = tf.image.resize(image, [IMG_ROWS, IMG_COLS])
+            return image_resized, tf.cast(label, tf.float32)
+
+        train_ds = train_ds.map(process_path, num_parallel_calls=NUM_PARALLEL_CALLS)
+
+        if LOG:
+            train_ds = train_ds.map(lambda x_img, y_lab: (x_img, log_transform_only(y_lab)), num_parallel_calls=NUM_PARALLEL_CALLS)
+
+        if AUGMENTATION_ENABLED:
+            print("INFO: Data augmentation - enabled.")
+            data_augmentation_layers = tf.keras.Sequential([
+                tf.keras.layers.RandomFlip("horizontal", seed=SEED),
+                tf.keras.layers.RandomRotation(factor=0.1, seed=SEED, fill_mode='reflect'),
+                tf.keras.layers.RandomZoom(height_factor=(-0.1, 0.1), width_factor=(-0.1, 0.1), seed=SEED, fill_mode='reflect'),
+                tf.keras.layers.RandomBrightness(factor=0.05, seed=SEED),
+                tf.keras.layers.RandomContrast(factor=0.05, seed=SEED)
+            ], name="data_augmentation")
+
+            def apply_augmentation(image, label):
+                if tf.random.uniform([], seed=SEED) > 0.5:
+                     image = data_augmentation_layers(image, training=True)
+                return image, label
+            train_ds = train_ds.map(apply_augmentation, num_parallel_calls=NUM_PARALLEL_CALLS)
+        else:
+            print("INFO: Data augmentation - disabled.")
+
+        train_ds = train_ds.shuffle(buffer_size=len(X_all_paths)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE) # Shuffle all data
+
+    model_checkpoint_save_freq = "epoch"
+    print(f"INFO: Full model checkpoints will be saved every epoch to .keras files.")
+
+    print("INFO: Building model...")
+    backbone_choice = args.backbone.lower() if args.backbone else "simple"
+    if backbone_choice == "xception": model = build_with_Xception(INPUT_SHAPE_RGB, NUM_CLASSES, REFINE_BACKBONE_ENABLED)
+    elif backbone_choice in ["simple", "none"]: model = build_simple_cnn(INPUT_SHAPE_RGB, NUM_CLASSES)
+    else:
+        print(f"WARNING: Unknown backbone '{args.backbone}'. Defaulting to simple CNN."); model = build_simple_cnn(INPUT_SHAPE_RGB, NUM_CLASSES)
+    print(f"INFO: Using {backbone_choice if backbone_choice != 'none' else 'simple'} backbone.")
+
+    loss_arg_str = args.loss_func if args.loss_func is not None else ""
+    loss_arg_lower = loss_arg_str.lower()
+    if loss_arg_lower.startswith("custom_"):
+        try:
+            parts = loss_arg_lower.split("_"); alpha = float(parts[1]); beta = float(parts[2])
+            current_loss_function = custom_regression_loss(alpha, beta)
+            print(f"INFO: Using custom loss with alpha={alpha}, beta={beta}.")
+        except Exception as e_loss:
+            print(f"ERROR: Invalid custom_loss format '{loss_arg_str}'. Error: {e_loss}. Defaulting to MSE_keras.")
+            current_loss_function = tf.keras.losses.MeanSquaredError()
+    elif loss_arg_lower == "mape_keras":
+        current_loss_function = tf.keras.losses.MeanAbsolutePercentageError(); print("INFO: Using Keras MAPE loss.")
+    elif loss_arg_lower == "mse_keras":
+        current_loss_function = tf.keras.losses.MeanSquaredError(); print("INFO: Using Keras MSE loss.")
+    else:
+        current_loss_function = tf.keras.losses.MeanSquaredError(); print(f"WARNING: Unrecognized loss '{loss_arg_str}'. Defaulting to MSE_keras.")
+
+    if args.checkpoint:
+        print(f"INFO: Loading model/weights from checkpoint: {args.checkpoint}")
+        custom_objects_dict = {'MAPE': MAPE}
+        if loss_arg_lower.startswith("custom_"):
+            custom_objects_dict['loss'] = current_loss_function
+        try:
+            if args.checkpoint.endswith(".keras"):
+                model = tf.keras.models.load_model(args.checkpoint, custom_objects=custom_objects_dict)
+                print("INFO: Successfully loaded full Keras model.")
+            elif args.checkpoint.endswith((".h5", ".weights.h5")):
+                model.load_weights(args.checkpoint).expect_partial()
+                print("INFO: Successfully loaded weights. Re-compiling model.")
+                model.compile(loss=current_loss_function, optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE), metrics=[MAPE])
+            else:
+                print(f"ERROR: Unknown checkpoint file type: {args.checkpoint}."); sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: Failed to load checkpoint: {e}\nINFO: Proceeding with a freshly initialized model.")
+            model.compile(loss=current_loss_function, optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE), metrics=[MAPE])
+    else:
+        model.compile(loss=current_loss_function, optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE), metrics=[MAPE])
+
+    model.summary(line_length=120)
+
+    keras_model_checkpoint_path_template = os.path.join(args.output_dir, "model_epoch_{epoch:04d}.keras")
+    callbacks = [
+        tf.keras.callbacks.TensorBoard(log_dir=os.path.join(args.output_dir, 'logs')),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=keras_model_checkpoint_path_template,
+            verbose=VERBOSE, save_weights_only=False, save_freq=model_checkpoint_save_freq)
+    ]
+
+    if EPOCHS > 0:
+        print(f"\nINFO: Starting training for {EPOCHS} epochs...")
+      
+        history = model.fit(train_ds, epochs=EPOCHS, verbose=VERBOSE, callbacks=callbacks)
+        print("\n--- Training Completed ---")
+
+        final_model_weights_path = os.path.join(args.output_dir, "final_model_weights.weights.h5")
+        model.save_weights(final_model_weights_path); print(f"INFO: Final model weights saved to: {final_model_weights_path}")
+        final_full_model_path = os.path.join(args.output_dir, "final_model_trained.keras")
+        model.save(final_full_model_path); print(f"INFO: Final full model saved to: {final_full_model_path}")
+        with open(os.path.join(args.output_dir, 'trainHistoryDict.pkl'), 'wb') as f_hist:
+            pickle.dump(history.history, f_hist)
+        print(f"INFO: Training history saved to: {os.path.join(args.output_dir, 'trainHistoryDict.pkl')}")
+
+    print("\nINFO: Evaluating model...")
+    eval_X_paths, eval_y_labels = None, None 
+    
+    
+
+    if TEST_DATA_PATH:
+        print(f"INFO: Loading TEST dataset from: {TEST_DATA_PATH}")
+        eval_X_paths, eval_y_labels = importLabeledImages(TEST_DATA_PATH)
+        if not eval_X_paths:
+            print(f"WARNING: No data from TEST dataset path: {TEST_DATA_PATH}. Fallback to ALL loaded data if available for evaluation.")
+            TEST_DATA_PATH = None 
+        else:
+            print(f"INFO: Evaluating on TEST dataset: {TEST_DATA_PATH} with {len(eval_X_paths)} images.")
+
+    if not TEST_DATA_PATH: # Fallback if no test data path 
+        
+        if 'X_all_paths' in locals() and X_all_paths and 'y_all_labels' in locals() and y_all_labels:
+            print("WARNING: No dedicated TEST dataset. Evaluating on ALL loaded data (real + synthetic).")
+            eval_X_paths, eval_y_labels = X_all_paths, y_all_labels # Use the combined dataset
+            print(f"INFO: Using ALL loaded data for evaluation with {len(eval_X_paths)} images.")
+        else:
+            print("ERROR: No data available for evaluation (neither test nor any training data paths were successfully processed). Exiting evaluation.")
+            sys.exit(1)
+
+
+    if eval_X_paths and eval_y_labels:
+        test_ds = tf.data.Dataset.from_tensor_slices((eval_X_paths, eval_y_labels))
+        test_ds = test_ds.map(process_path, num_parallel_calls=NUM_PARALLEL_CALLS)
+        if LOG:
+            test_ds = test_ds.map(lambda x_img, y_lab: (x_img, log_transform_only(y_lab)), num_parallel_calls=NUM_PARALLEL_CALLS)
+        test_ds = test_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+        print("INFO: Evaluating on the selected evaluation dataset...")
+        score = model.evaluate(test_ds, verbose=VERBOSE)
+        print(f"INFO: Evaluation Score (Loss: {score[0]:.4f}, Custom MAPE Metric: {score[1]:.2f}%)")
+
+        y_pred_model_output_log_scale = model.predict(test_ds, verbose=VERBOSE)
+
+        if LOG:
+            y_pred_original_scale = delog_predictions(y_pred_model_output_log_scale).numpy()
+        else:
+            y_pred_original_scale = y_pred_model_output_log_scale.numpy()
+
+        y_pred_out_flat = y_pred_original_scale.flatten()
+        actual_eval_y_labels = np.array(eval_y_labels, dtype=float)
+
+        min_len = min(len(y_pred_out_flat), len(actual_eval_y_labels))
+        if len(y_pred_out_flat) != len(actual_eval_y_labels):
+            print(f"WARNING: Pred/GT length mismatch. Preds: {len(y_pred_out_flat)}, GT: {len(actual_eval_y_labels)}. Trimming to {min_len}.")
+            y_pred_out_flat = y_pred_out_flat[:min_len]
+            actual_eval_y_labels_for_df = actual_eval_y_labels[:min_len]
+            eval_X_paths_for_df = eval_X_paths[:min_len] if eval_X_paths else None 
+        else:
+            actual_eval_y_labels_for_df = actual_eval_y_labels
+            eval_X_paths_for_df = eval_X_paths
+
+        
+        if eval_X_paths_for_df is None or len(eval_X_paths_for_df) != min_len:
+            eval_X_paths_for_df = [f"path_not_available_{i}" for i in range(min_len)]
+
+
+        results_summary_path = os.path.join(args.output_dir, 'scores_summary.txt')
+        with open(results_summary_path, 'w') as f_summary:
+            f_summary.write("--- Training Settings ---\n"); [f_summary.write(f"{k_arg.upper()}: {v_arg}\n") for k_arg, v_arg in vars(args).items()]
+            f_summary.write(f"LOG_TRANSFORM_ACTIVE: {LOG}\n")
+            if LOG: f_summary.write(f"CALCULATED_LOG_Y_MIN (Informational): {LOG_Y_MIN_CALCULATED}\nCALCULATED_LOG_Y_MAX (Informational): {LOG_Y_MAX_CALCULATED}\n")
+            f_summary.write(f"Score (Loss, MAPE%): {score[0]:.4f}, {score[1]:.2f}\n") # score[1] is MAPE
+        print(f"INFO: Results summary saved to: {results_summary_path}")
+
+        df_results = pd.DataFrame({"file_path": eval_X_paths_for_df,
+                                   "ground_truth_area": actual_eval_y_labels_for_df,
+                                   "predicted_area_original_scale": y_pred_out_flat})
+        csv_results_path = os.path.join(args.output_dir, 'evaluation_predictions_and_gt.csv')
+        df_results.to_csv(csv_results_path, index=False); print(f"INFO: Evaluation predictions CSV saved to: {csv_results_path}")
+    else:
+        print("INFO: No data available for final evaluation step (eval_X_paths or eval_y_labels were empty).")
+
+    print("\n--- Script Execution Finished ---")
